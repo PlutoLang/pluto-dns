@@ -1,0 +1,119 @@
+local base64 <const> = require "pluto:base64"
+local http <const> = require "pluto:http"
+
+enum begin
+    DNS_A = 1,
+    DNS_AAAA = 28,
+    DNS_CNAME = 5,
+    DNS_PTR = 12,
+    DNS_TXT = 16,
+    DNS_MX = 15,
+    DNS_SRV = 33,
+    DNS_NS = 2,
+end
+
+local typestrtoint <const> = {
+    ["A"] = DNS_A,
+    ["AAAA"] = DNS_AAAA,
+    ["CNAME"] = DNS_CNAME,
+    ["PTR"] = DNS_PTR,
+    ["TXT"] = DNS_TXT,
+    ["MX"] = DNS_MX,
+    ["SRV"] = DNS_SRV,
+    ["NS"] = DNS_NS,
+}
+
+local typeinttostr <const> = {
+    [DNS_A] = "A",
+    [DNS_AAAA] = "AAAA",
+    [DNS_CNAME] = "CNAME",
+    [DNS_PTR] = "PTR",
+    [DNS_TXT] = "TXT",
+    [DNS_MX] = "MX",
+    [DNS_SRV] = "SRV",
+    [DNS_NS] = "NS",
+}
+
+local function pack_dns_name(chunks, name)
+    for name:split(".") as chunk do
+        chunks:insert(string.pack(">s1", chunk))
+    end
+    chunks:insert("\0")
+end
+
+local function unpack_dns_name(t, str, i, limit = 20)
+    local len
+    while true do
+        len, i = string.unpack(">I1", str, i)
+        if len == 0 then
+            break
+        end
+        if (len >> 6) == 0b11 then
+            local ptr = (len & 0b111111) << 8
+            ptr |= string.unpack(">I1", str, i) ++i
+            assert(limit > 0, "recursion limit reached")
+            unpack_dns_name(t, str, ptr + 1, limit - 1)
+            break
+        end
+        t:insert(str:sub(i, (i + len) - 1))
+        i += len
+    end
+    return i
+end
+
+local dns = {}
+
+class dns.httpresolver
+    function __construct(public server = "1.1.1.1")
+    end
+
+    function query(type, name)
+        return self:queries{ { type = type, name = name } }
+    end
+
+    function queries(qs)
+        local chunks = {}
+        chunks:insert(string.pack(">I2I1I1I2I2I2I2", 0, 1, 0, #qs, 0, 0, 0))
+        for qs as q do
+            pack_dns_name(chunks, q.name)
+            chunks:insert(string.pack(">I2I2", typestrtoint[q.type], 1))
+        end
+
+        local res = http.request($"https://{self.server}/dns-query?dns={base64.urlencode(chunks:concat())}")
+
+        local id, bitfield1, bitfield2, qdcount, ancount, nscount, arcount, i = string.unpack(">I2I1I1I2I2I2I2", res)
+
+        for _ = 1, qdcount do
+            i = unpack_dns_name({}, res, i)
+            i += 4
+        end
+
+        local rrs = {}
+        for _ = 1, ancount do
+            local rname = {}
+            i = unpack_dns_name(rname, res, i)
+            local rr = { name = rname:concat(".") }
+            local rtype, rclass, data
+            rtype, rclass, rr.ttl, data, i = string.unpack(">I2I2I4s2", res, i)
+            rr.type = typeinttostr[rtype]
+            if rtype == DNS_A then
+                local ip = string.unpack(">I4", data)
+                rr.ip = "%d.%d.%d.%d":format(ip >> 24, (ip >> 16) & 0xff, (ip >> 8) & 0xff, ip & 0xff)
+            elseif rtype == DNS_TXT then
+                rr.data = ""
+                local j = 1
+                while j < #data do
+                    local chunk
+                    chunk, j = string.unpack(">s1", data, j)
+                    rr.data ..= chunk
+                end
+            else
+                rr.data = data
+            end
+            rrs:insert(rr)
+        end
+        return rrs
+    end
+end
+
+return dns
